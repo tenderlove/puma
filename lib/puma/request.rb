@@ -50,10 +50,6 @@ module Puma
     # @param requests [Integer]
     # @return [:close, :keep_alive, :async]
     def handle_request(client, requests)
-      if client.h2c
-        return handle_h2c(client)
-      end
-
       env = client.env
       io_buffer = client.io_buffer
       socket  = client.io   # io may be a MiniSSL::Socket
@@ -711,7 +707,7 @@ module Puma
 
       handler = HTWO::RackHandler.new(
         @app,
-        executor: HTWO::ThreadPerRequest.new,
+        executor: @h2_executor,
         server_name: "localhost",
         server_port: "80",
         scheme: "http"

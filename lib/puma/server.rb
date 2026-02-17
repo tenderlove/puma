@@ -259,6 +259,9 @@ module Puma
 
       @status = :run
 
+      require "concurrent"
+
+      @h2_executor = Concurrent::FixedThreadPool.new(5)
       @thread_pool = ThreadPool.new(thread_name, options, server: self) { |client| process_client client }
 
       if @queue_requests
@@ -500,6 +503,11 @@ module Puma
         while can_loop
           can_loop = false
           @requests_count += 1
+          if client.h2c
+            handle_h2c(client)
+            close_socket = false
+            return
+          end
           case handle_request(client, requests + 1)
           when :close
           when :async
