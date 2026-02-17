@@ -50,6 +50,10 @@ module Puma
     # @param requests [Integer]
     # @return [:close, :keep_alive, :async]
     def handle_request(client, requests)
+      if client.h2c
+        return handle_h2c(client)
+      end
+
       env = client.env
       io_buffer = client.io_buffer
       socket  = client.io   # io may be a MiniSSL::Socket
@@ -700,5 +704,24 @@ module Puma
       resp_info
     end
     private :str_headers
+
+    def handle_h2c(client)
+      require 'htwo'
+      require 'htwo/rack_handler'
+
+      handler = HTWO::RackHandler.new(
+        @app,
+        executor: HTWO::ThreadPerRequest.new,
+        server_name: "localhost",
+        server_port: "80",
+        scheme: "http"
+      )
+
+      session = HTWO::Session.new(client.io, handler: handler)
+      session.receive(preface_verified: true)
+      session.join
+      :close
+    end
+    private :handle_h2c
   end
 end

@@ -109,7 +109,7 @@ module Puma
 
     attr_reader :env, :to_io, :body, :io, :timeout_at, :ready, :hijacked,
                 :tempfile, :io_buffer, :http_content_length_limit_exceeded,
-                :requests_served
+                :requests_served, :h2c
 
     attr_writer :peerip, :http_content_length_limit
 
@@ -246,7 +246,12 @@ module Puma
 
       data = nil
       begin
-        data = @io.read_nonblock(CHUNK_SIZE)
+        # Limit first read(s) to detect H2 preface before parser sees anything
+        if @parsed_bytes == 0 && (!@buffer || @buffer.bytesize < 24)
+          data = @io.read_nonblock(24 - (@buffer&.bytesize || 0))
+        else
+          data = @io.read_nonblock(CHUNK_SIZE)
+        end
       rescue IO::WaitReadable
         return false
       rescue EOFError
@@ -269,6 +274,27 @@ module Puma
       end
 
       return false unless try_to_parse_proxy_protocol
+
+      # Check for HTTP/2 connection preface before feeding to HTTP/1.1 parser
+      if @parsed_bytes == 0
+        if @buffer.bytesize >= 24
+          if @buffer == "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+            @h2c = true
+            @buffer = nil
+            set_ready
+            return true
+          end
+          # Not H2 preface, fall through to parser
+        elsif @buffer.bytesize >= 4
+          unless @buffer.start_with?("PRI ")
+            # Definitely not H2, fall through to parser
+          else
+            return false  # Might be H2, need more bytes
+          end
+        else
+          return false  # Need at least 4 bytes to distinguish
+        end
+      end
 
       @parsed_bytes = parser_execute
 
