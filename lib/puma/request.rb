@@ -702,10 +702,10 @@ module Puma
     private :str_headers
 
     def handle_h2c(client)
-      require 'htwo'
-      require 'htwo/rack_handler'
+      require 'kantan'
+      require 'kantan/rack_handler'
 
-      handler = HTWO::RackHandler.new(
+      handler = Kantan::RackHandler.new(
         @app,
         executor: @h2_executor,
         server_name: "localhost",
@@ -713,9 +713,8 @@ module Puma
         scheme: "http"
       )
 
-      session = HTWO::Session.new(client.io, handler: handler)
+      session = Kantan::Session.new(client.io, handler: handler)
       session.receive(preface_verified: true)
-      session.join
       :close
     end
     private :handle_h2c
