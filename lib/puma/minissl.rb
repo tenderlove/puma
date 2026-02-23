@@ -6,25 +6,36 @@ rescue LoadError
 end
 
 require 'open3'
-# need for Puma::MiniSSL::OPENSSL constants used in `HAS_TLS1_3`
-# use require, see https://github.com/puma/puma/pull/2381
-require 'puma/puma_http11'
+require 'openssl'
+require 'securerandom'
 
 module Puma
   module MiniSSL
-    # Define constant at runtime, as it's easy to determine at built time,
-    # but Puma could (it shouldn't) be loaded with an older OpenSSL version
+    OPENSSL_VERSION = OpenSSL::OPENSSL_VERSION
+    OPENSSL_LIBRARY_VERSION = OpenSSL::OPENSSL_LIBRARY_VERSION
+
+    # SSL3 is disabled in all OpenSSL versions that support Ruby 2.5+
+    OPENSSL_NO_SSL3 = true
+    OPENSSL_NO_TLS1 = false
+    OPENSSL_NO_TLS1_1 = false
+
+    # Remove any SSLError defined by C/Java extensions before redefining
+    remove_const :SSLError if const_defined?(:SSLError, false)
+    class SSLError < OpenSSL::SSL::SSLError; end
+
+    # No-op, kept for backward compatibility
+    def self.check; end
+
     # @version 5.0.0
-    HAS_TLS1_3 = IS_JRUBY ||
-        ((OPENSSL_VERSION[/ \d+\.\d+\.\d+/].split('.').map(&:to_i) <=> [1,1,1]) != -1 &&
-         (OPENSSL_LIBRARY_VERSION[/ \d+\.\d+\.\d+/].split('.').map(&:to_i) <=> [1,1,1]) !=-1)
+    HAS_TLS1_3 = OpenSSL::SSL.const_defined?(:TLS1_3_VERSION)
 
     class Socket
-      def initialize(socket, engine)
-        @socket = socket
-        @engine = engine
+      def initialize(ssl_socket, tcp_socket)
+        @ssl_socket = ssl_socket
+        @socket = tcp_socket
+        @handshake_done = false
         @peercert = nil
-        @reuse = nil
+        @failed_cert = nil
       end
 
       # @!attribute [r] to_io
@@ -36,145 +47,50 @@ module Puma
         @socket.closed?
       end
 
-      # Returns a two element array,
-      # first is protocol version (SSL_get_version),
-      # second is 'handshake' state (SSL_state_string)
-      #
-      # Used for dropping tcp connections to ssl.
-      # See OpenSSL ssl/ssl_stat.c SSL_state_string for info
-      # @!attribute [r] ssl_version_state
-      # @version 5.0.0
-      #
-      def ssl_version_state
-        IS_JRUBY ? [nil, nil] : @engine.ssl_vers_st
-      end
-
-      # Used to check the handshake status, in particular when a TCP connection
-      # is made with TLSv1.3 as an available protocol
-      # @version 5.0.0
-      def bad_tlsv1_3?
-        HAS_TLS1_3 && ssl_version_state == ['TLSv1.3', 'SSLERR']
-      end
-      private :bad_tlsv1_3?
-
       def readpartial(size)
-        while true
-          output = @engine.read
-          return output if output
-
-          data = @socket.readpartial(size)
-          @engine.inject(data)
-          output = @engine.read
-
-          return output if output
-
-          while neg_data = @engine.extract
-            @socket.write neg_data
-          end
-        end
-      end
-
-      def engine_read_all
-        output = @engine.read
-        while output and additional_output = @engine.read
-          output << additional_output
-        end
-        output
+        ensure_handshake
+        @ssl_socket.readpartial(size)
+      rescue OpenSSL::SSL::SSLError => e
+        raise SSLError, e.message
       end
 
       def read_nonblock(size, *_)
-        # *_ is to deal with keyword args that were added
-        # at some point (and being used in the wild)
-        while true
-          output = engine_read_all
-          return output if output
-
-          data = @socket.read_nonblock(size, exception: false)
-          if data == :wait_readable || data == :wait_writable
-            # It would make more sense to let @socket.read_nonblock raise
-            # EAGAIN if necessary but it seems like it'll misbehave on Windows.
-            # I don't have a Windows machine to debug this so I can't explain
-            # exactly whats happening in that OS. Please let me know if you
-            # find out!
-            #
-            # In the meantime, we can emulate the correct behavior by
-            # capturing :wait_readable & :wait_writable and raising EAGAIN
-            # ourselves.
-            raise IO::EAGAINWaitReadable
-          elsif data.nil?
-            raise SSLError.exception "HTTP connection?" if bad_tlsv1_3?
-            return nil
-          end
-
-          @engine.inject(data)
-          output = engine_read_all
-
-          return output if output
-
-          while neg_data = @engine.extract
-            @socket.write neg_data
-          end
-        end
+        ensure_handshake
+        @ssl_socket.read_nonblock(size)
+      rescue IO::WaitReadable, IO::WaitWritable
+        raise IO::EAGAINWaitReadable
+      rescue OpenSSL::SSL::SSLError => e
+        raise SSLError, e.message
       end
 
       def write(data)
-        return 0 if data.empty?
-
-        data_size = data.bytesize
-        need = data_size
-
-        while true
-          wrote = @engine.write data
-
-          enc_wr = +''
-          while (enc = @engine.extract)
-            enc_wr << enc
-          end
-          @socket.write enc_wr unless enc_wr.empty?
-
-          need -= wrote
-
-          return data_size if need == 0
-
-          data = data.byteslice(wrote..-1)
-        end
+        ensure_handshake
+        @ssl_socket.write(data)
+      rescue OpenSSL::SSL::SSLError => e
+        raise SSLError, e.message
       end
 
       alias_method :syswrite, :write
       alias_method :<<, :write
 
-      # This is a temporary fix to deal with websockets code using
-      # write_nonblock.
-
-      # The problem with implementing it properly
-      # is that it means we'd have to have the ability to rewind
-      # an engine because after we write+extract, the socket
-      # write_nonblock call might raise an exception and later
-      # code would pass the same data in, but the engine would think
-      # it had already written the data in.
-      #
-      # So for the time being (and since write blocking is quite rare),
-      # go ahead and actually block in write_nonblock.
-      #
       def write_nonblock(data, *_)
         write data
       end
 
       def flush
-        @socket.flush
+        @ssl_socket.flush
       end
 
       def close
         begin
-          unless @engine.shutdown
-            while alert_data = @engine.extract
-              @socket.write alert_data
-            end
+          if @handshake_done
+            @ssl_socket.flush rescue nil
+            @ssl_socket.sysclose
           end
         rescue IOError, SystemCallError
           # nothing
         ensure
-          @socket.close
+          @socket.close unless @socket.closed?
         end
       end
 
@@ -183,25 +99,28 @@ module Puma
         @socket.peeraddr
       end
 
-      # OpenSSL is loaded in `MiniSSL::ContextBuilder` when
-      # `MiniSSL::Context#verify_mode` is not `VERIFY_NONE`.
-      # When `VERIFY_NONE`, `MiniSSL::Engine#peercert` is nil, regardless of
-      # whether the client sends a cert.
       # @return [OpenSSL::X509::Certificate, nil]
       # @!attribute [r] peercert
       def peercert
         return @peercert if @peercert
-
-        raw = @engine.peercert
-        return nil unless raw
-
-        @peercert = OpenSSL::X509::Certificate.new raw
+        @peercert = @ssl_socket.peer_cert || @failed_cert
       end
-    end
 
-    if IS_JRUBY
-      OPENSSL_NO_SSL3 = false
-      OPENSSL_NO_TLS1 = false
+      private
+
+      def ensure_handshake
+        return if @handshake_done
+        Thread.current[:puma_failed_cert] = nil
+        begin
+          @ssl_socket.accept
+        rescue OpenSSL::SSL::SSLError => e
+          raise SSLError, e.message
+        ensure
+          @handshake_done = true
+          @failed_cert = Thread.current[:puma_failed_cert]
+          Thread.current[:puma_failed_cert] = nil
+        end
+      end
     end
 
     class Context
@@ -225,8 +144,102 @@ module Puma
         raise ArgumentError, "#{desc} file '#{file}' is not readable" unless File.readable? file
       end
 
+      # PEM-based properties (all platforms)
+      attr_reader :key
+      attr_reader :key_password_command
+      attr_reader :cert
+      attr_reader :ca
+      attr_reader :cert_pem
+      attr_reader :key_pem
+      attr_accessor :ssl_cipher_filter
+      attr_accessor :ssl_ciphersuites
+      attr_accessor :verification_flags
+
+      attr_reader :reuse, :reuse_cache_size, :reuse_timeout
+
+      def key=(key)
+        check_file key, 'Key'
+        @key = key
+      end
+
+      def key_password_command=(key_password_command)
+        @key_password_command = key_password_command
+      end
+
+      def cert=(cert)
+        check_file cert, 'Cert'
+        @cert = cert
+      end
+
+      def ca=(ca)
+        check_file ca, 'ca'
+        @ca = ca
+      end
+
+      def cert_pem=(cert_pem)
+        raise ArgumentError, "'cert_pem' is not a String" unless cert_pem.is_a? String
+        @cert_pem = cert_pem
+      end
+
+      def key_pem=(key_pem)
+        raise ArgumentError, "'key_pem' is not a String" unless key_pem.is_a? String
+        @key_pem = key_pem
+      end
+
+      # Executes the command to return the password needed to decrypt the key.
+      def key_password
+        raise "Key password command not configured" if @key_password_command.nil?
+
+        stdout_str, stderr_str, status = Open3.capture3(@key_password_command)
+
+        return stdout_str.chomp if status.success?
+
+        raise "Key password failed with code #{status.exitstatus}: #{stderr_str}"
+      end
+
+      # Controls session reuse.  Allowed values are as follows:
+      # * 'off' - matches the behavior of Puma 5.6 and earlier.  This is included
+      #   in case reuse 'on' is made the default in future Puma versions.
+      # * 'dflt' - sets session reuse on, with OpenSSL default cache size of
+      #   20k and default timeout of 300 seconds.
+      # * 's,t' - where s and t are integer strings, for size and timeout.
+      # * 's' - where s is an integer strings for size.
+      # * ',t' - where t is an integer strings for timeout.
+      #
+      def reuse=(reuse_str)
+        case reuse_str
+        when 'off'
+          @reuse = nil
+        when 'dflt'
+          @reuse = true
+        when /\A\d+\z/
+          @reuse = true
+          @reuse_cache_size = reuse_str.to_i
+        when /\A\d+,\d+\z/
+          @reuse = true
+          size, time = reuse_str.split ','
+          @reuse_cache_size = size.to_i
+          @reuse_timeout = time.to_i
+        when /\A,\d+\z/
+          @reuse = true
+          @reuse_timeout = reuse_str.delete(',').to_i
+        end
+      end
+
+      def check
+        has_pem = @key || @key_pem || @cert || @cert_pem
+        has_keystore = respond_to?(:keystore) && @keystore
+
+        if has_keystore && !has_pem
+          # JRuby keystore-only config
+        elsif has_pem || !has_keystore
+          raise "Key not configured" if @key.nil? && @key_pem.nil?
+          raise "Cert not configured" if @cert.nil? && @cert_pem.nil?
+        end
+      end
+
       if IS_JRUBY
-        # jruby-specific Context properties: java uses a keystore and password pair rather than a cert/key pair
+        # JRuby-specific: Java keystore/truststore properties (in addition to PEM above)
         attr_reader :keystore
         attr_reader :keystore_type
         attr_accessor :keystore_pass
@@ -242,8 +255,6 @@ module Puma
         end
 
         def truststore=(truststore)
-          # NOTE: historically truststore was assumed the same as keystore, this is kept for backwards
-          # compatibility, to rely on JVM's trust defaults we allow setting `truststore = :default`
           unless truststore.eql?(:default)
             raise ArgumentError, "No such truststore file '#{truststore}'" unless File.exist?(truststore)
           end
@@ -265,106 +276,12 @@ module Puma
           @cipher_suites = list
         end
 
-        # aliases for backwards compatibility
         alias_method :ssl_cipher_list, :cipher_suites
         alias_method :ssl_cipher_list=, :cipher_suites=
 
         def protocols=(list)
           list = list.split(',').map(&:strip) if list.is_a?(String)
           @protocols = list
-        end
-
-        def check
-          raise "Keystore not configured" unless @keystore
-          # @truststore defaults to @keystore due backwards compatibility
-        end
-
-      else
-        # non-jruby Context properties
-        attr_reader :key
-        attr_reader :key_password_command
-        attr_reader :cert
-        attr_reader :ca
-        attr_reader :cert_pem
-        attr_reader :key_pem
-        attr_accessor :ssl_cipher_filter
-        attr_accessor :ssl_ciphersuites
-        attr_accessor :verification_flags
-
-        attr_reader :reuse, :reuse_cache_size, :reuse_timeout
-
-        def key=(key)
-          check_file key, 'Key'
-          @key = key
-        end
-
-        def key_password_command=(key_password_command)
-          @key_password_command = key_password_command
-        end
-
-        def cert=(cert)
-          check_file cert, 'Cert'
-          @cert = cert
-        end
-
-        def ca=(ca)
-          check_file ca, 'ca'
-          @ca = ca
-        end
-
-        def cert_pem=(cert_pem)
-          raise ArgumentError, "'cert_pem' is not a String" unless cert_pem.is_a? String
-          @cert_pem = cert_pem
-        end
-
-        def key_pem=(key_pem)
-          raise ArgumentError, "'key_pem' is not a String" unless key_pem.is_a? String
-          @key_pem = key_pem
-        end
-
-        def check
-          raise "Key not configured" if @key.nil? && @key_pem.nil?
-          raise "Cert not configured" if @cert.nil? && @cert_pem.nil?
-        end
-
-        # Executes the command to return the password needed to decrypt the key.
-        def key_password
-          raise "Key password command not configured" if @key_password_command.nil?
-
-          stdout_str, stderr_str, status = Open3.capture3(@key_password_command)
-
-          return stdout_str.chomp if status.success?
-
-          raise "Key password failed with code #{status.exitstatus}: #{stderr_str}"
-        end
-
-        # Controls session reuse.  Allowed values are as follows:
-        # * 'off' - matches the behavior of Puma 5.6 and earlier.  This is included
-        #   in case reuse 'on' is made the default in future Puma versions.
-        # * 'dflt' - sets session reuse on, with OpenSSL default cache size of
-        #   20k and default timeout of 300 seconds.
-        # * 's,t' - where s and t are integer strings, for size and timeout.
-        # * 's' - where s is an integer strings for size.
-        # * ',t' - where t is an integer strings for timeout.
-        #
-        def reuse=(reuse_str)
-          case reuse_str
-          when 'off'
-            @reuse = nil
-          when 'dflt'
-            @reuse = true
-          when /\A\d+\z/
-            @reuse = true
-            @reuse_cache_size = reuse_str.to_i
-          when /\A\d+,\d+\z/
-            @reuse = true
-            size, time = reuse_str.split ','
-            @reuse_cache_size = size.to_i
-            @reuse_timeout = time.to_i
-          when /\A,\d+\z/
-            @reuse = true
-            @reuse_timeout = reuse_str.delete(',').to_i
-          end
         end
       end
 
@@ -414,25 +331,238 @@ module Puma
       "NO_CHECK_TIME"        => 0x200000
     }.freeze
 
+    # Creates an OpenSSL::SSL::SSLContext from a Puma::MiniSSL::Context.
+    # Handles both MRI-style (key/cert PEM files) and JRuby-style (Java keystore) configuration.
+    def self.create_openssl_context(puma_ctx)
+      ctx = OpenSSL::SSL::SSLContext.new
+
+      cert = nil
+      extra_chain_certs = []
+      key = nil
+
+      if puma_ctx.respond_to?(:keystore) && puma_ctx.keystore
+        # JRuby keystore path: extract cert and key via Java APIs
+        key, cert, extra_chain_certs = load_keystore(
+          puma_ctx.keystore, puma_ctx.keystore_pass, puma_ctx.keystore_type
+        )
+
+        # Truststore for CA verification
+        if puma_ctx.respond_to?(:truststore) && puma_ctx.truststore
+          load_truststore(ctx, puma_ctx)
+        end
+      else
+        # MRI path: PEM files or strings
+        if puma_ctx.cert
+          pem = File.read(puma_ctx.cert)
+          certs = pem.scan(/-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----/m)
+          raise SSLError, "error in file '#{puma_ctx.cert}': no certificate found" if certs.empty?
+          cert = OpenSSL::X509::Certificate.new(certs.first)
+          extra_chain_certs = certs[1..].map { |c| OpenSSL::X509::Certificate.new(c) }
+        elsif puma_ctx.cert_pem
+          certs = puma_ctx.cert_pem.scan(/-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----/m)
+          raise SSLError, "error with parameter 'cert_pem': no certificate found" if certs.empty?
+          cert = OpenSSL::X509::Certificate.new(certs.first)
+          extra_chain_certs = certs[1..].map { |c| OpenSSL::X509::Certificate.new(c) }
+        end
+
+        password = puma_ctx.key_password_command ? puma_ctx.key_password : nil
+        if puma_ctx.key
+          key = OpenSSL::PKey.read(File.read(puma_ctx.key), password)
+        elsif puma_ctx.key_pem
+          key = OpenSSL::PKey.read(puma_ctx.key_pem, password)
+        end
+
+        # CA - set for verification and load eagerly to validate
+        if puma_ctx.ca
+          ctx.ca_file = puma_ctx.ca
+          store = ctx.cert_store || OpenSSL::X509::Store.new
+          store.add_file(puma_ctx.ca)
+          ctx.cert_store = store
+
+          # Also add CA certs to server's sent chain (matches original
+          # SSL_CTX_load_verify_locations behavior with auto chain building)
+          ca_pem = File.read(puma_ctx.ca)
+          ca_certs = ca_pem.scan(/-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----/m)
+          ca_certs.each { |c| extra_chain_certs << OpenSSL::X509::Certificate.new(c) }
+        end
+      end
+
+      # Set certificate, key, and chain on context
+      if cert && key
+        if ctx.respond_to?(:add_certificate)
+          ctx.add_certificate(cert, key, extra_chain_certs)
+        else
+          # add_certificate is not available on JRuby's openssl.
+          # extra_chain_cert= is also buggy on JRuby (breaks handshake),
+          # so we only set cert and key here.
+          ctx.cert = cert
+          ctx.key = key
+        end
+      else
+        ctx.cert = cert if cert
+        ctx.key = key if key
+      end
+
+      # Verify mode with callback to capture failed certs
+      if puma_ctx.verify_mode
+        ctx.verify_mode = puma_ctx.verify_mode
+        ctx.verify_callback = lambda do |preverify_ok, store_ctx|
+          unless preverify_ok
+            Thread.current[:puma_failed_cert] = store_ctx.current_cert
+          end
+          preverify_ok
+        end
+      end
+
+      # Verification flags
+      if puma_ctx.verification_flags
+        ctx.cert_store ||= OpenSSL::X509::Store.new
+        ctx.cert_store.flags = puma_ctx.verification_flags
+      end
+
+      # TLS version constraints
+      ssl_options = OpenSSL::SSL::OP_CIPHER_SERVER_PREFERENCE | OpenSSL::SSL::OP_NO_COMPRESSION
+
+      if ctx.respond_to?(:min_version=)
+        if puma_ctx.no_tlsv1_1
+          ctx.min_version = OpenSSL::SSL::TLS1_2_VERSION
+        elsif puma_ctx.no_tlsv1
+          ctx.min_version = OpenSSL::SSL::TLS1_1_VERSION
+        end
+      else
+        ssl_options |= OpenSSL::SSL::OP_NO_SSLv2 | OpenSSL::SSL::OP_NO_SSLv3
+        if puma_ctx.no_tlsv1
+          ssl_options |= OpenSSL::SSL::OP_NO_TLSv1
+        end
+        if puma_ctx.no_tlsv1_1
+          ssl_options |= OpenSSL::SSL::OP_NO_TLSv1 | OpenSSL::SSL::OP_NO_TLSv1_1
+        end
+      end
+
+      ctx.options |= ssl_options
+
+      # Ciphers
+      cipher_filter = puma_ctx.ssl_cipher_filter
+      cipher_filter ||= puma_ctx.cipher_suites if puma_ctx.respond_to?(:cipher_suites)
+
+      if cipher_filter
+        ctx.ciphers = cipher_filter
+      else
+        ctx.ciphers = "HIGH:!aNULL@STRENGTH"
+      end
+
+      if puma_ctx.ssl_ciphersuites && ctx.respond_to?(:ciphersuites=)
+        ctx.ciphersuites = puma_ctx.ssl_ciphersuites
+      end
+
+      # JRuby protocol restrictions
+      if puma_ctx.respond_to?(:protocols) && puma_ctx.respond_to?(:cipher_suites) && puma_ctx.protocols && ctx.respond_to?(:min_version=)
+        versions = puma_ctx.protocols.map { |p| p.sub('TLSv', '').sub('.', '_') }
+        # e.g. ['TLSv1.2'] -> set min and max to TLS 1.2
+        min_v = versions.min
+        max_v = versions.max
+        version_map = { '1' => OpenSSL::SSL::TLS1_VERSION, '1_1' => OpenSSL::SSL::TLS1_1_VERSION,
+                        '1_2' => OpenSSL::SSL::TLS1_2_VERSION }
+        version_map['1_3'] = OpenSSL::SSL::TLS1_3_VERSION if HAS_TLS1_3
+        ctx.min_version = version_map[min_v] if version_map[min_v]
+        ctx.max_version = version_map[max_v] if version_map[max_v]
+      end
+
+      # Session reuse
+      if puma_ctx.reuse
+        ctx.session_cache_mode = OpenSSL::SSL::SSLContext::SESSION_CACHE_SERVER
+        ctx.session_cache_size = puma_ctx.reuse_cache_size if puma_ctx.reuse_cache_size
+        ctx.timeout = puma_ctx.reuse_timeout if puma_ctx.reuse_timeout
+      else
+        ctx.session_cache_mode = OpenSSL::SSL::SSLContext::SESSION_CACHE_OFF
+      end
+
+      # Session ID context
+      ctx.session_id_context = SecureRandom.bytes(32)
+
+      ctx
+    rescue OpenSSL::OpenSSLError => e
+      raise SSLError, e.message unless e.is_a?(SSLError)
+      raise
+    end
+
+    if IS_JRUBY
+      # Loads a Java KeyStore and returns [key, cert, extra_chain_certs]
+      def self.load_keystore(path, password, type = nil)
+        type ||= 'jks'
+        ks = java.security.KeyStore.getInstance(type)
+        password_chars = password&.to_java&.toCharArray
+
+        fis = java.io.FileInputStream.new(path)
+        begin
+          ks.load(fis, password_chars)
+        ensure
+          fis.close
+        end
+
+        ks.aliases.each do |ali|
+          next unless ks.isKeyEntry(ali)
+
+          java_key = ks.getKey(ali, password_chars)
+          java_chain = ks.getCertificateChain(ali)
+
+          # Convert PKCS#8 DER to PEM for OpenSSL::PKey.read
+          b64 = java.util.Base64.getEncoder.encodeToString(java_key.getEncoded)
+          pem_key = "-----BEGIN PRIVATE KEY-----\n#{b64.scan(/.{1,64}/).join("\n")}\n-----END PRIVATE KEY-----\n"
+          key = OpenSSL::PKey.read(pem_key)
+
+          certs = java_chain.map { |c| OpenSSL::X509::Certificate.new(String.from_java_bytes(c.getEncoded)) }
+
+          return [key, certs.first, certs[1..] || []]
+        end
+
+        raise SSLError, "No private key entry found in keystore '#{path}'"
+      end
+
+      # Loads a Java TrustStore into the SSLContext's cert_store
+      def self.load_truststore(ctx, puma_ctx)
+        return if puma_ctx.truststore.eql?(:default)
+
+        type = puma_ctx.truststore_type || 'jks'
+        ts = java.security.KeyStore.getInstance(type)
+        password_chars = puma_ctx.truststore_pass&.to_java&.toCharArray
+
+        fis = java.io.FileInputStream.new(puma_ctx.truststore)
+        begin
+          ts.load(fis, password_chars)
+        ensure
+          fis.close
+        end
+
+        store = ctx.cert_store || OpenSSL::X509::Store.new
+        ts.aliases.each do |ali|
+          next unless ts.isCertificateEntry(ali)
+          java_cert = ts.getCertificate(ali)
+          store.add_cert(OpenSSL::X509::Certificate.new(String.from_java_bytes(java_cert.getEncoded)))
+        end
+        ctx.cert_store = store
+      end
+    end
+
     class Server
       def initialize(socket, ctx)
         @socket = socket
         @ctx = ctx
-        @eng_ctx = IS_JRUBY ? @ctx : SSLContext.new(ctx)
+        @openssl_ctx = MiniSSL.create_openssl_context(ctx)
       end
 
       def accept
         @ctx.check
         io = @socket.accept
-        engine = Engine.server @eng_ctx
-        Socket.new io, engine
+        ssl_socket = OpenSSL::SSL::SSLSocket.new(io, @openssl_ctx)
+        Socket.new ssl_socket, io
       end
 
       def accept_nonblock
         @ctx.check
         io = @socket.accept_nonblock
-        engine = Engine.server @eng_ctx
-        Socket.new io, engine
+        ssl_socket = OpenSSL::SSL::SSLSocket.new(io, @openssl_ctx)
+        Socket.new ssl_socket, io
       end
 
       # @!attribute [r] to_io

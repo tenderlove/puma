@@ -22,9 +22,7 @@ module Puma
   autoload :Launcher,  "#{__dir__}/puma/launcher"
   autoload :LogWriter, "#{__dir__}/puma/log_writer"
 
-  # at present, MiniSSL::Engine is only defined in extension code (puma_http11),
-  # not in minissl.rb
-  HAS_SSL = const_defined?(:MiniSSL, false) && MiniSSL.const_defined?(:Engine, false)
+  HAS_SSL = !ENV['PUMA_DISABLE_SSL'] && (require('openssl') rescue false)
 
   HAS_UNIX_SOCKET = Object.const_defined?(:UNIXSocket) && !IS_WINDOWS
 

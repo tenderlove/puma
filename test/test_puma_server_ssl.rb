@@ -27,8 +27,6 @@ if ::Puma::HAS_SSL
 end
 
 class TestPumaServerSSL < PumaTest
-  parallelize_me!
-
   include TestPuma
   include TestPuma::PumaSocket
 
@@ -51,13 +49,8 @@ class TestPumaServerSSL < PumaTest
 
     ctx = Puma::MiniSSL::Context.new
 
-    if Puma.jruby?
-      ctx.keystore =  File.expand_path "../examples/puma/keystore.jks", __dir__
-      ctx.keystore_pass = 'jruby_puma'
-    else
-      ctx.key  =  File.expand_path "../examples/puma/puma_keypair.pem", __dir__
-      ctx.cert = File.expand_path "../examples/puma/cert_puma.pem", __dir__
-    end
+    ctx.key  =  File.expand_path "../examples/puma/puma_keypair.pem", __dir__
+    ctx.cert = File.expand_path "../examples/puma/cert_puma.pem", __dir__
 
     ctx.verify_mode = Puma::MiniSSL::VERIFY_NONE
 
@@ -148,10 +141,10 @@ class TestPumaServerSSL < PumaTest
       end
     end
 
-    expected = Puma::IS_JRUBY ?
-      /No appropriate protocol \(protocol is disabled or cipher suites are inappropriate\)/ :
-      /SSL_connect SYSCALL returned=5|wrong version number|(unknown|unsupported) protocol|no protocols available|version too low|unknown SSL method/
-    assert_match expected, msg
+    assert_match(
+      /SSL_connect SYSCALL returned=5|wrong version number|(unknown|unsupported) protocol|no protocols available|version too low|unknown SSL method|No appropriate protocol|protocol is disabled/,
+      msg
+    )
 
     # make sure a good request succeeds
     assert_equal "https", send_http_read_resp_body(ctx: new_ctx)
@@ -194,7 +187,7 @@ class TestPumaServerSSL < PumaTest
     start_server
 
     tcp = Thread.new do
-      assert_raises(Errno::ECONNREFUSED, EOFError, IOError, Timeout::Error) do
+      assert_raises(Errno::ECONNREFUSED, Errno::ECONNRESET, EOFError, IOError, Timeout::Error) do
         body_http = send_http_read_resp_body timeout: 4
       end
     end
@@ -239,68 +232,66 @@ class TestPumaServerSSL < PumaTest
     assert_empty @log_stderr.string
   end
 
-  unless Puma.jruby?
-    def test_invalid_cert
-      assert_raises(Puma::MiniSSL::SSLError) do
-        start_server { |ctx| ctx.cert = __FILE__ }
-      end
+  def test_invalid_cert
+    assert_raises(Puma::MiniSSL::SSLError) do
+      start_server { |ctx| ctx.cert = __FILE__ }
     end
+  end
 
-    def test_invalid_key
-      assert_raises(Puma::MiniSSL::SSLError) do
-        start_server { |ctx| ctx.key = __FILE__ }
-      end
+  def test_invalid_key
+    assert_raises(Puma::MiniSSL::SSLError) do
+      start_server { |ctx| ctx.key = __FILE__ }
     end
+  end
 
-    def test_invalid_cert_pem
-      assert_raises(Puma::MiniSSL::SSLError) do
-        start_server { |ctx|
-          ctx.instance_variable_set(:@cert, nil)
-          ctx.cert_pem = 'Not a valid pem'
-        }
-      end
+  def test_invalid_cert_pem
+    assert_raises(Puma::MiniSSL::SSLError) do
+      start_server { |ctx|
+        ctx.instance_variable_set(:@cert, nil)
+        ctx.cert_pem = 'Not a valid pem'
+      }
     end
+  end
 
-    def test_invalid_key_pem
-      assert_raises(Puma::MiniSSL::SSLError) do
-        start_server { |ctx|
-          ctx.instance_variable_set(:@key, nil)
-          ctx.key_pem = 'Not a valid pem'
-        }
-      end
+  def test_invalid_key_pem
+    assert_raises(Puma::MiniSSL::SSLError) do
+      start_server { |ctx|
+        ctx.instance_variable_set(:@key, nil)
+        ctx.key_pem = 'Not a valid pem'
+      }
     end
+  end
 
-    def test_invalid_ca
-      assert_raises(Puma::MiniSSL::SSLError) do
-        start_server { |ctx|
-          ctx.ca = __FILE__
-        }
-      end
+  def test_invalid_ca
+    assert_raises(Puma::MiniSSL::SSLError) do
+      start_server { |ctx|
+        ctx.ca = __FILE__
+      }
     end
+  end
 
-    # this may require updates if TLSv1.3 default ciphers change
-    def test_ssl_ciphersuites
-      skip('Requires TLSv1.3') unless Puma::MiniSSL::HAS_TLS1_3
+  # this may require updates if TLSv1.3 default ciphers change
+  def test_ssl_ciphersuites
+    skip('Requires TLSv1.3') unless Puma::MiniSSL::HAS_TLS1_3
 
-      start_server
-      default_cipher = send_http(ctx: new_ctx).cipher[0]
-      @server&.stop true
+    start_server
+    default_cipher = send_http(ctx: new_ctx).cipher[0]
+    @server&.stop true
 
-      cipher_suite = 'TLS_CHACHA20_POLY1305_SHA256'
-      start_server { |ctx| ctx.ssl_ciphersuites = cipher_suite}
+    cipher_suite = 'TLS_CHACHA20_POLY1305_SHA256'
+    start_server { |ctx| ctx.ssl_ciphersuites = cipher_suite}
 
-      cipher = send_http(ctx: new_ctx).cipher
+    cipher = send_http(ctx: new_ctx).cipher
 
-      refute_equal default_cipher, cipher[0]
-      assert_equal cipher_suite  , cipher[0]
-      assert_equal cipher[1], 'TLSv1.3'
-    end
+    refute_equal default_cipher, cipher[0]
+    assert_equal cipher_suite  , cipher[0]
+    assert_equal cipher[1], 'TLSv1.3'
   end
 end if ::Puma::HAS_SSL
 
 # client-side TLS authentication tests
 class TestPumaServerSSLClient < PumaTest
-  parallelize_me! unless ::Puma.jruby?
+  parallelize_me!
 
   include TestPuma
   include TestPuma::PumaSocket
@@ -309,14 +300,9 @@ class TestPumaServerSSLClient < PumaTest
 
   # Context can be shared, may help with JRuby
   CTX = Puma::MiniSSL::Context.new.tap { |ctx|
-    if Puma.jruby?
-      ctx.keystore =  "#{CERT_PATH}/keystore.jks"
-      ctx.keystore_pass = 'jruby_puma'
-    else
-      ctx.key  = "#{CERT_PATH}/server.key"
-      ctx.cert = "#{CERT_PATH}/server.crt"
-      ctx.ca   = "#{CERT_PATH}/ca.crt"
-    end
+    ctx.key  = "#{CERT_PATH}/server.key"
+    ctx.cert = "#{CERT_PATH}/server.crt"
+    ctx.ca   = "#{CERT_PATH}/ca.crt"
     ctx.verify_mode = Puma::MiniSSL::VERIFY_PEER | Puma::MiniSSL::VERIFY_FAIL_IF_NO_PEER_CERT
   }
 
@@ -362,16 +348,13 @@ class TestPumaServerSSLClient < PumaTest
   end
 
   def test_verify_fail_if_no_client_cert
-    error = Puma.jruby? ? /Empty client certificate chain/ : 'peer did not return a certificate'
-    assert_ssl_client_error_match(error) do |client_ctx|
+    assert_ssl_client_error_match(/peer did not return a certificate/) do |client_ctx|
       # nothing
     end
   end
 
   def test_verify_fail_if_client_unknown_ca
-    error = Puma.jruby? ? /No trusted certificate found/ : /self[- ]signed certificate in certificate chain/
-    cert_subject = Puma.jruby? ? '/DC=net/DC=puma/CN=localhost' : '/DC=net/DC=puma/CN=CAU'
-    assert_ssl_client_error_match(error, subject: cert_subject) do |client_ctx|
+    assert_ssl_client_error_match(/self[- ]signed certificate in certificate chain/, subject: '/DC=net/DC=puma/CN=CAU') do |client_ctx|
       key = "#{CERT_PATH}/client_unknown.key"
       crt = "#{CERT_PATH}/client_unknown.crt"
       client_ctx.key = OpenSSL::PKey::RSA.new File.read(key)
@@ -381,8 +364,7 @@ class TestPumaServerSSLClient < PumaTest
   end
 
   def test_verify_fail_if_client_expired_cert
-    error = Puma.jruby? ? /NotAfter:/ : 'certificate has expired'
-    assert_ssl_client_error_match(error, subject: '/DC=net/DC=puma/CN=localhost') do |client_ctx|
+    assert_ssl_client_error_match(/certificate has expired/, subject: '/DC=net/DC=puma/CN=localhost') do |client_ctx|
       key = "#{CERT_PATH}/client_expired.key"
       crt = "#{CERT_PATH}/client_expired.crt"
       client_ctx.key = OpenSSL::PKey::RSA.new File.read(key)
@@ -522,7 +504,7 @@ class TestPumaServerSSLClient < PumaTest
 end if ::Puma::HAS_SSL
 
 class TestPumaServerSSLClientCloseError < PumaTest
-  parallelize_me! unless ::Puma.jruby?
+  parallelize_me!
 
   include TestPuma
   include TestPuma::PumaSocket
@@ -531,14 +513,9 @@ class TestPumaServerSSLClientCloseError < PumaTest
 
   # Context can be shared, may help with JRuby
   CTX = Puma::MiniSSL::Context.new.tap { |ctx|
-    if Puma.jruby?
-      ctx.keystore =  "#{CERT_PATH}/keystore.jks"
-      ctx.keystore_pass = 'jruby_puma'
-    else
-      ctx.key  = "#{CERT_PATH}/server.key"
-      ctx.cert = "#{CERT_PATH}/server.crt"
-      ctx.ca   = "#{CERT_PATH}/ca.crt"
-    end
+    ctx.key  = "#{CERT_PATH}/server.key"
+    ctx.cert = "#{CERT_PATH}/server.crt"
+    ctx.ca   = "#{CERT_PATH}/ca.crt"
     ctx.verify_mode = Puma::MiniSSL::VERIFY_PEER | Puma::MiniSSL::VERIFY_FAIL_IF_NO_PEER_CERT
   }
 
