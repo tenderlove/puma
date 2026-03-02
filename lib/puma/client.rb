@@ -51,6 +51,9 @@ module Puma
     # using chunk size extensions before we abort the connection.
     MAX_CHUNK_EXCESS = 16 * 1024
 
+    # HTTP/2 connection preface (24 bytes)
+    H2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
     # Content-Length header value validation
     CONTENT_LENGTH_VALUE_INVALID = /[^\d]/.freeze
 
@@ -103,13 +106,15 @@ module Puma
 
       @in_last_chunk = false
 
+      @h2 = false
+
       # need unfrozen ASCII-8BIT, +'' is UTF-8
       @read_buffer = String.new # rubocop: disable Performance/UnfreezeString
     end
 
     attr_reader :env, :to_io, :body, :io, :timeout_at, :ready, :hijacked,
                 :tempfile, :io_buffer, :http_content_length_limit_exceeded,
-                :requests_served
+                :requests_served, :h2
 
     attr_writer :peerip, :http_content_length_limit
 
@@ -244,9 +249,19 @@ module Puma
 
       return read_body if in_data_phase
 
+      # ALPN h2 detection — triggers SSL handshake without reading app data
+      if @parsed_bytes == 0 && @io.respond_to?(:alpn_protocol) && @io.alpn_protocol == 'h2'
+        @h2 = true
+        @buffer = nil
+        set_ready
+        return true
+      end
+
       data = nil
       begin
-        data = @io.read_nonblock(CHUNK_SIZE)
+        # Limit initial read to 24 bytes for h2c preface detection on cleartext
+        sz = (@parsed_bytes == 0 && !@io.respond_to?(:alpn_protocol)) ? 24 : CHUNK_SIZE
+        data = @io.read_nonblock(sz)
       rescue IO::WaitReadable
         return false
       rescue EOFError
@@ -269,6 +284,18 @@ module Puma
       end
 
       return false unless try_to_parse_proxy_protocol
+
+      # h2c preface detection (cleartext connections only)
+      if @parsed_bytes == 0 && !@io.respond_to?(:alpn_protocol) && @buffer
+        if @buffer.bytesize >= 24 && @buffer.start_with?(H2_PREFACE)
+          @h2 = true
+          @buffer = nil
+          set_ready
+          return true
+        elsif @buffer.bytesize < 24 && H2_PREFACE.start_with?(@buffer)
+          return false
+        end
+      end
 
       @parsed_bytes = parser_execute
 

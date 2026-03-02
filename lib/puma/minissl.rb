@@ -47,6 +47,20 @@ module Puma
         @socket.closed?
       end
 
+      def read(size)
+        ensure_handshake
+        @ssl_socket.read(size)
+      rescue OpenSSL::SSL::SSLError => e
+        raise SSLError, e.message
+      end
+
+      def readbyte
+        ensure_handshake
+        @ssl_socket.readbyte
+      rescue OpenSSL::SSL::SSLError => e
+        raise SSLError, e.message
+      end
+
       def readpartial(size)
         ensure_handshake
         @ssl_socket.readpartial(size)
@@ -104,6 +118,11 @@ module Puma
       def peercert
         return @peercert if @peercert
         @peercert = @ssl_socket.peer_cert || @failed_cert
+      end
+
+      def alpn_protocol
+        ensure_handshake
+        @ssl_socket.alpn_protocol
       end
 
       private
@@ -479,6 +498,11 @@ module Puma
 
       # Session ID context
       ctx.session_id_context = SecureRandom.bytes(32)
+
+      # ALPN for HTTP/2 (server-side selection callback)
+      ctx.alpn_select_cb = lambda { |protocols|
+        protocols.include?('h2') ? 'h2' : protocols.include?('http/1.1') ? 'http/1.1' : nil
+      }
 
       ctx
     rescue OpenSSL::OpenSSLError => e

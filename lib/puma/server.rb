@@ -496,6 +496,12 @@ module Puma
           client.finish(@first_data_timeout)
         end
 
+        if client.h2
+          handle_h2(client)
+          close_socket = false
+          return
+        end
+
         can_loop = true
         while can_loop
           can_loop = false

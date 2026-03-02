@@ -33,6 +33,30 @@ module Puma
 
     include Puma::Const
 
+    class H2Executor
+      def post(stream, body, &block)
+        Thread.new { block.call(stream, body) }
+      end
+    end
+
+    def handle_h2(client)
+      require 'kantan/h2'
+      require 'kantan/rack_handler'
+
+      is_ssl = client.io.is_a?(MiniSSL::Socket)
+      addr = client.listener.addr
+
+      handler = Kantan::RackHandler.new(@app,
+        executor: H2Executor.new,
+        server_name: addr[2],
+        server_port: addr[1].to_s,
+        scheme: is_ssl ? "https" : "http")
+
+      session = Kantan::H2::Session.new(client.io, handler: handler)
+      session.receive(preface_verified: !is_ssl)
+      session.join
+    end
+
     # Takes the request contained in +client+, invokes the Rack application to construct
     # the response and writes it back to +client.io+.
     #
