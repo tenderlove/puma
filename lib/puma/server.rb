@@ -29,6 +29,8 @@ module Puma
   # `Puma::Reactor` where they get eventually passed to a `Puma::ThreadPool`.
   #
   # Each `Puma::Server` will have one reactor and one thread pool.
+  QuicClient = Struct.new(:conn, :udp, :addr)
+
   class Server
     module FiberPerRequest
       def handle_request(client, requests)
@@ -343,6 +345,13 @@ module Puma
         queue_requests = @queue_requests
         drain = options[:drain_on_shutdown] ? 0 : nil
 
+        # QUIC/HTTP3 listeners (UDP sockets alongside TCP/SSL)
+        quic_map = {}
+        @binder.quic_listeners.each do |ql|
+          quic_map[ql[:udp]] = ql
+          sockets << ql[:udp]
+        end
+
         addr_send_name, addr_value = case options[:remote_address]
         when :value
           [:peerip=, options[:remote_address_value]]
@@ -356,8 +365,19 @@ module Puma
 
         while @status == :run || (drain && shutting_down?)
           begin
-            ios = IO.select sockets, nil, nil, (shutting_down? ? 0 : @idle_timeout)
+            timeout = shutting_down? ? 0 : @idle_timeout
+            # Use shortest QUIC event_timeout so retransmission/ack timers fire
+            quic_map.each_value do |ql|
+              if (qt = ql[:listener].event_timeout) && (timeout.nil? || qt < timeout)
+                timeout = qt
+              end
+            end
+
+            ios = IO.select sockets, nil, nil, timeout
             unless ios
+              # Process QUIC events even on timeout (timer-driven)
+              quic_map.each_value { |ql| ql[:listener].handle_events }
+
               unless shutting_down?
                 @idle_timeout_reached = true
 
@@ -365,12 +385,13 @@ module Puma
                   @worker_write << "#{PipeRequest::PIPE_IDLE}#{Process.pid}\n" rescue nil
                   next
                 else
+                  next if quic_map.any? # don't idle-stop when QUIC is active
                   @log_writer.log "- Idle timeout reached"
                   @status = :stop
                 end
               end
 
-              break
+              break unless quic_map.any?
             end
 
             if @idle_timeout_reached && @clustered
@@ -381,6 +402,11 @@ module Puma
             ios.first.each do |sock|
               if sock == check
                 break if handle_check
+              elsif quic = quic_map[sock]
+                quic[:listener].handle_events
+                while (conn = quic[:listener].accept_connection_nonblock(exception: false)) != :wait_readable
+                  pool << QuicClient.new(conn, quic[:udp], quic[:addr])
+                end
               else
                 # if ThreadPool out_of_band code is running, we don't want to add
                 # clients until the code is finished.
@@ -478,6 +504,11 @@ module Puma
     #
     # Return true if one or more requests were processed.
     def process_client(client)
+      if client.is_a?(QuicClient)
+        handle_h3(client)
+        return
+      end
+
       close_socket = true
 
       requests = 0

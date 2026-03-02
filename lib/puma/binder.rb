@@ -51,9 +51,10 @@ module Puma
 
       @envs = {}
       @ios = []
+      @quic_listeners = []
     end
 
-    attr_reader :ios
+    attr_reader :ios, :quic_listeners
 
     # @version 5.0.0
     attr_reader :activated_sockets, :envs, :inherited_fds, :listeners, :proto_env, :unix_paths
@@ -67,6 +68,7 @@ module Puma
 
     def close
       @ios.each { |i| i.close }
+      @quic_listeners.each { |ql| ql[:udp].close rescue nil }
     end
 
     # @!attribute [r] connected_ports
@@ -388,6 +390,35 @@ module Puma
       @envs[ssl] = env
 
       @ios << ssl
+
+      # Auto-create QUIC/HTTP3 listener on the same port (UDP)
+      if OpenSSL::SSL::SSLContext.respond_to?(:quic)
+        begin
+          quic_ctx = OpenSSL::SSL::SSLContext.quic(:server)
+
+          if ctx.cert
+            quic_ctx.cert = OpenSSL::X509::Certificate.new(File.read(ctx.cert))
+            password = ctx.key_password_command ? ctx.key_password : nil
+            quic_ctx.key = OpenSSL::PKey.read(File.read(ctx.key), password)
+          elsif ctx.cert_pem
+            quic_ctx.cert = OpenSSL::X509::Certificate.new(ctx.cert_pem)
+            password = ctx.key_password_command ? ctx.key_password : nil
+            quic_ctx.key = OpenSSL::PKey.read(ctx.key_pem, password)
+          end
+
+          quic_ctx.alpn_select_cb = ->(protos) { protos.include?("h3") ? "h3" : protos.first }
+
+          udp = UDPSocket.new
+          udp.bind(host, port)
+          quic_listener = OpenSSL::SSL::SSLSocket.new_listener(udp, context: quic_ctx)
+          quic_listener.listen
+
+          @quic_listeners << { listener: quic_listener, udp: udp, addr: ssl.addr }
+        rescue => e
+          # QUIC not available or setup failed — H1/H2 only
+        end
+      end
+
       s
     end
 

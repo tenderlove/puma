@@ -57,6 +57,24 @@ module Puma
       session.join
     end
 
+    def handle_h3(client)
+      require 'kantan/h3/poll_session'
+      require 'kantan/rack_handler'
+
+      addr = client.addr
+
+      handler = Kantan::RackHandler.new(@app,
+        executor: H2Executor.new,
+        server_name: addr[2],
+        server_port: addr[1].to_s,
+        scheme: "https")
+
+      session = Kantan::H3::PollSession.new(client.conn,
+        io: client.udp,
+        handler: handler)
+      session.run
+    end
+
     # Takes the request contained in +client+, invokes the Rack application to construct
     # the response and writes it back to +client.io+.
     #
