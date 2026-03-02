@@ -22,7 +22,7 @@ module Puma
   autoload :Launcher,  "#{__dir__}/puma/launcher"
   autoload :LogWriter, "#{__dir__}/puma/log_writer"
 
-  HAS_SSL = !ENV['PUMA_DISABLE_SSL'] && (require('openssl') rescue false)
+  HAS_SSL = !ENV['PUMA_DISABLE_SSL'] && (require('openssl'); true) rescue false
 
   HAS_UNIX_SOCKET = Object.const_defined?(:UNIXSocket) && !IS_WINDOWS
 
